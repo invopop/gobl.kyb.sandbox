@@ -1,0 +1,432 @@
+package domain
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/invopop/gobl"
+	"github.com/invopop/gobl/head"
+	goblnet "github.com/invopop/gobl/net"
+	"github.com/invopop/gobl/org"
+
+	"github.com/invopop/gobl.kyb.sandbox/internal/domain/delivery"
+	"github.com/invopop/gobl.kyb.sandbox/internal/domain/mailer"
+	"github.com/invopop/gobl.kyb.sandbox/internal/domain/models"
+	"github.com/invopop/gobl.kyb.sandbox/internal/domain/repos"
+)
+
+// deliveryTimeout bounds a single outbound POST to the authority's
+// inbox, and a single confirmation email submission.
+const deliveryTimeout = 30 * time.Second
+
+// confirmTokenTTL bounds how long an emailed confirmation link works.
+// Re-registering issues a fresh link.
+const confirmTokenTTL = 72 * time.Hour
+
+// Verifications manages the business logic for identity verifications:
+// accepting a registered envelope, emailing the party's published
+// address, recording the attestation, and delivering the verifier
+// countersignature back to the registration authority's inbox.
+type Verifications struct {
+	store         VerificationStore
+	identity      *Identity
+	client        *goblnet.Client
+	sender        delivery.Sender
+	mailer        mailer.Mailer
+	authority     goblnet.Address
+	publicBaseURL string
+	log           *slog.Logger
+}
+
+// newVerifications instantiates the verifications domain service.
+func newVerifications(store VerificationStore, identity *Identity, client *goblnet.Client, sender delivery.Sender, m mailer.Mailer, authority goblnet.Address, publicBaseURL string, log *slog.Logger) *Verifications {
+	if canon, err := goblnet.ParseAddress(string(authority)); err == nil {
+		authority = canon
+	}
+	return &Verifications{
+		store:         store,
+		identity:      identity,
+		client:        client,
+		sender:        sender,
+		mailer:        m,
+		authority:     authority,
+		publicBaseURL: publicBaseURL,
+		log:           log,
+	}
+}
+
+// Authority returns the registration authority this verifier works for.
+func (d *Verifications) Authority() goblnet.Address { return d.authority }
+
+// Receive processes an incoming verification request: a registered
+// envelope containing the subject's org.Party, countersigned by the
+// registration authority. It verifies the subject's signature and the
+// authority's countersignature, requires a published email address,
+// persists the record, and queues the confirmation email. The
+// persisted record is returned once stored; the email is sent in the
+// background.
+func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*models.Verification, error) {
+	if err := env.Validate(); err != nil {
+		d.log.Warn("inbox.rejected", "reason", "validation", "error", err.Error())
+		return nil, ErrValidation.WithMessage("envelope failed validation: %s", err.Error())
+	}
+
+	subject, err := d.client.VerifyEnvelope(ctx, env, "")
+	if err != nil {
+		if errors.Is(err, goblnet.ErrUnavailable) {
+			d.log.Warn("inbox.rejected", "reason", "verify_unavailable", "error", err.Error())
+			return nil, ErrUnavailable.WithMessage("could not reach the subject's key endpoint; retry later")
+		}
+		d.log.Warn("inbox.rejected", "reason", "verify_failed", "error", err.Error())
+		return nil, ErrUnauthorized.WithMessage("signature verification failed")
+	}
+
+	// The subject's self-signature on a registered envelope is bound
+	// to the registration authority (its signed aud): require exactly
+	// the authority we work for, rejecting envelopes registered under
+	// some other registry before any further key fetching.
+	p, perr := head.SignedPayload(env.Signatures[0])
+	if perr != nil {
+		d.log.Warn("inbox.rejected", "reason", "verify_failed", "caller", string(subject), "error", perr.Error())
+		return nil, ErrUnauthorized.WithMessage("could not read signed payload")
+	}
+	if aud, aerr := goblnet.ParseAddress(p.Aud); aerr != nil || aud != d.authority {
+		d.log.Warn("inbox.rejected", "reason", "aud_mismatch", "caller", string(subject), "aud", p.Aud)
+		return nil, ErrUnauthorized.WithMessage("envelope audience must be the registration authority %s", d.authority)
+	}
+
+	// Only registered envelopes are eligible: the authority's
+	// countersignature both proves registration and tells us the
+	// registry will accept our countersignature for this exact
+	// uuid + digest.
+	if _, err := d.client.VerifyAuthority(ctx, env); err != nil {
+		if errors.Is(err, goblnet.ErrUnavailable) {
+			d.log.Warn("inbox.rejected", "reason", "authority_unavailable", "caller", string(subject), "error", err.Error())
+			return nil, ErrUnavailable.WithMessage("could not reach the registration authority's key endpoint; retry later")
+		}
+		d.log.Warn("inbox.rejected", "reason", "authority_missing", "caller", string(subject), "error", err.Error())
+		return nil, ErrForbidden.WithMessage("envelope must carry a valid registration countersignature from %s", d.authority)
+	}
+
+	party, ok := env.Extract().(*org.Party)
+	if !ok {
+		d.log.Warn("inbox.rejected", "reason", "not_a_party", "caller", string(subject))
+		return nil, ErrValidation.WithMessage("verification envelope must contain an org.Party document")
+	}
+	email := partyEmail(party)
+	if email == "" {
+		d.log.Warn("inbox.rejected", "reason", "no_email", "caller", string(subject))
+		return nil, ErrValidation.WithMessage("party must publish an email address to be verified")
+	}
+
+	rec, resend, err := d.upsert(ctx, subject, email, env)
+	if err != nil {
+		d.log.Error("inbox.persist_failed", "caller", string(subject), "error", err.Error())
+		return nil, ErrInternal.WithCause(err)
+	}
+	d.log.Info("inbox.accepted",
+		"caller", string(subject),
+		"envelope", env.Head.UUID.String(),
+		"status", string(rec.Status),
+		"email_queued", resend,
+	)
+
+	// Fire-and-forget side effects: the caller is acknowledged as soon
+	// as we've persisted. The goroutines mutate their record (status,
+	// email/delivery bookkeeping), so hand them a copy — the record
+	// returned to the caller stays immutable after return.
+	recCopy := *rec
+	if resend {
+		go d.emailAsync(&recCopy)
+	} else {
+		// Same digest, already attested: no second attestation needed,
+		// deliver the countersignature straight away.
+		go d.deliverAsync(&recCopy)
+	}
+
+	return rec, nil
+}
+
+// Confirmation resolves a confirmation token to its record for the
+// confirm page: ErrNotFound for an unknown token, ErrGone for an
+// expired one. Records that have already progressed past pending are
+// returned as-is so the page can render the idempotent thank-you.
+func (d *Verifications) Confirmation(ctx context.Context, token string) (*models.Verification, error) {
+	return d.byToken(ctx, token)
+}
+
+// Confirm records the subject's legal attestation and queues delivery
+// of the verifier countersignature to the registration authority. The
+// call is idempotent: a record already confirmed (or delivered) is
+// returned unchanged, and a failed delivery is retried.
+func (d *Verifications) Confirm(ctx context.Context, token string) (*models.Verification, error) {
+	rec, err := d.byToken(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Status == models.StatusConfirmed || rec.Status == models.StatusDelivered {
+		return rec, nil
+	}
+	now := time.Now().UTC()
+	if rec.ConfirmedAt == nil {
+		rec.ConfirmedAt = &now
+	}
+	rec.Status = models.StatusConfirmed
+	rec.LastDeliveryError = ""
+	if err := d.store.Put(ctx, rec); err != nil {
+		if errors.Is(err, repos.ErrConflict) {
+			// A concurrent confirmation won the write; the outcome the
+			// subject wanted has happened.
+			return d.byToken(ctx, token)
+		}
+		d.log.Error("confirm.persist_failed", "address", string(rec.Address), "error", err.Error())
+		return nil, ErrInternal.WithCause(err)
+	}
+	d.log.Info("confirm.accepted",
+		"address", string(rec.Address),
+		"envelope", rec.EnvelopeUUID.String(),
+	)
+	recCopy := *rec
+	go d.deliverAsync(&recCopy)
+	return rec, nil
+}
+
+// Redeliver countersigns and delivers an already-confirmed
+// verification synchronously — the recovery path when the async
+// delivery after confirmation failed.
+func (d *Verifications) Redeliver(ctx context.Context, addr goblnet.Address) (*models.Verification, error) {
+	rec, err := d.store.Get(ctx, addr)
+	if errors.Is(err, repos.ErrNotFound) {
+		return nil, ErrNotFound.WithMessage("no verification for %s", addr)
+	}
+	if err != nil {
+		return nil, ErrInternal.WithCause(err)
+	}
+	if rec.ConfirmedAt == nil {
+		return nil, ErrValidation.WithMessage("verification for %s has not been confirmed", addr)
+	}
+
+	env, err := d.countersignedCopy(rec)
+	if err != nil {
+		return nil, ErrInternal.WithCause(err)
+	}
+	now := time.Now().UTC()
+	rec.DeliveryAttempts++
+	rec.LastDeliveryAt = &now
+
+	sendCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
+	defer cancel()
+	if err := d.sender.Send(sendCtx, d.authority, env); err != nil {
+		rec.Status = models.StatusFailed
+		rec.LastDeliveryError = err.Error()
+		_ = d.store.Put(ctx, rec)
+		return nil, ErrInternal.WithCause(fmt.Errorf("deliver countersigned envelope: %w", err))
+	}
+	rec.Status = models.StatusDelivered
+	rec.LastDeliveryError = ""
+	if err := d.store.Put(ctx, rec); err != nil {
+		return nil, ErrInternal.WithCause(err)
+	}
+	d.log.Info("verification delivered",
+		"address", string(rec.Address),
+		"envelope", rec.EnvelopeUUID.String(),
+	)
+	return rec, nil
+}
+
+// byToken maps a token lookup onto domain errors.
+func (d *Verifications) byToken(ctx context.Context, token string) (*models.Verification, error) {
+	if token == "" {
+		return nil, ErrNotFound
+	}
+	rec, err := d.store.GetByToken(ctx, token)
+	switch {
+	case errors.Is(err, repos.ErrNotFound):
+		return nil, ErrNotFound
+	case err != nil:
+		return nil, ErrInternal.WithCause(err)
+	}
+	if rec.TokenExpired(time.Now().UTC()) {
+		return nil, ErrGone.WithMessage("confirmation link has expired; re-register to receive a new one")
+	}
+	return rec, nil
+}
+
+// upsert reads any existing record for the subject (preserving the
+// store's _rev token for optimistic concurrency), then writes the new
+// state. The second return reports whether a confirmation email is
+// needed: a re-submission of the exact envelope digest that was
+// already attested skips the email — the attestation binds to the
+// digest, so only delivery remains.
+func (d *Verifications) upsert(ctx context.Context, subject goblnet.Address, email string, env *gobl.Envelope) (*models.Verification, bool, error) {
+	fresh := models.NewVerification(subject, email, env)
+	token, err := newToken()
+	if err != nil {
+		return nil, false, err
+	}
+	fresh.Token = token
+	fresh.TokenExpiresAt = fresh.ReceivedAt.Add(confirmTokenTTL)
+
+	prev, err := d.store.Get(ctx, subject)
+	switch {
+	case errors.Is(err, repos.ErrNotFound):
+		if err := d.store.Put(ctx, fresh); err != nil {
+			return nil, false, err
+		}
+		return fresh, true, nil
+	case err != nil:
+		return nil, false, err
+	}
+
+	if prev.ConfirmedAt != nil && prev.EnvelopeDigest == fresh.EnvelopeDigest {
+		// Renewal of an attested digest: keep the confirmation, reset
+		// the delivery bookkeeping so the fresh countersignature goes
+		// out again.
+		prev.Envelope = env
+		prev.EnvelopeUUID = fresh.EnvelopeUUID
+		prev.ReceivedAt = fresh.ReceivedAt
+		prev.Email = email
+		prev.Status = models.StatusConfirmed
+		prev.DeliveryAttempts = 0
+		prev.LastDeliveryError = ""
+		prev.LastDeliveryAt = nil
+		if err := d.store.Put(ctx, prev); err != nil {
+			return nil, false, err
+		}
+		return prev, false, nil
+	}
+
+	// Anything else restarts the attestation: new token, new expiry,
+	// cleared confirmation and delivery state.
+	fresh.Rev = prev.Rev
+	if err := d.store.Put(ctx, fresh); err != nil {
+		return nil, false, err
+	}
+	return fresh, true, nil
+}
+
+// emailAsync sends the confirmation email and records the outcome. A
+// failure leaves the record pending with the error noted — the
+// subject recovers by re-registering, which issues a fresh link.
+func (d *Verifications) emailAsync(rec *models.Verification) {
+	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+	defer cancel()
+	msg := confirmationMessage(rec, d.identity.Address(), d.authority, d.publicBaseURL)
+	now := time.Now().UTC()
+	if err := d.mailer.Send(ctx, msg); err != nil {
+		rec.LastEmailError = err.Error()
+		d.log.Warn("email.send_failed",
+			"address", string(rec.Address),
+			"to", rec.Email,
+			"error", err.Error(),
+		)
+	} else {
+		rec.EmailSentAt = &now
+		rec.LastEmailError = ""
+		d.log.Info("email.sent",
+			"address", string(rec.Address),
+			"to", rec.Email,
+		)
+	}
+	if err := d.store.Put(ctx, rec); err != nil {
+		d.log.Error("email.persist_failed",
+			"address", string(rec.Address),
+			"error", err.Error(),
+		)
+	}
+}
+
+// deliverAsync countersigns the stored envelope and POSTs it to the
+// authority's inbox, recording the outcome. Failures are not retried
+// in-process — recovery is the redeliver command or repeating the
+// confirmation.
+func (d *Verifications) deliverAsync(rec *models.Verification) {
+	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+	defer cancel()
+	env, err := d.countersignedCopy(rec)
+	if err != nil {
+		rec.Status = models.StatusFailed
+		rec.LastDeliveryError = err.Error()
+		d.log.Error("deliver.countersign_failed",
+			"address", string(rec.Address),
+			"error", err.Error(),
+		)
+		if perr := d.store.Put(ctx, rec); perr != nil {
+			d.log.Error("deliver.persist_failed", "address", string(rec.Address), "error", perr.Error())
+		}
+		return
+	}
+	rec.DeliveryAttempts++
+	now := time.Now().UTC()
+	rec.LastDeliveryAt = &now
+	if err := d.sender.Send(ctx, d.authority, env); err != nil {
+		rec.Status = models.StatusFailed
+		rec.LastDeliveryError = err.Error()
+		d.log.Warn("deliver.failed",
+			"address", string(rec.Address),
+			"envelope", rec.EnvelopeUUID.String(),
+			"attempts", rec.DeliveryAttempts,
+			"error", err.Error(),
+		)
+	} else {
+		rec.Status = models.StatusDelivered
+		rec.LastDeliveryError = ""
+		d.log.Info("deliver.sent",
+			"address", string(rec.Address),
+			"envelope", rec.EnvelopeUUID.String(),
+		)
+	}
+	if err := d.store.Put(ctx, rec); err != nil {
+		d.log.Error("deliver.persist_failed",
+			"address", string(rec.Address),
+			"error", err.Error(),
+		)
+	}
+}
+
+// countersignedCopy countersigns a fresh copy of the stored envelope.
+// The stored envelope is never signed directly: Envelope.Sign clears
+// every signature when post-sign validation fails, and each delivery
+// should carry a freshly-stamped exp anyway.
+func (d *Verifications) countersignedCopy(rec *models.Verification) (*gobl.Envelope, error) {
+	if rec.Envelope == nil {
+		return nil, errors.New("verification has no stored envelope")
+	}
+	data, err := json.Marshal(rec.Envelope)
+	if err != nil {
+		return nil, fmt.Errorf("marshal stored envelope: %w", err)
+	}
+	env := new(gobl.Envelope)
+	if err := json.Unmarshal(data, env); err != nil {
+		return nil, fmt.Errorf("decode stored envelope: %w", err)
+	}
+	if err := d.identity.CounterSign(env, rec.Address); err != nil {
+		return nil, fmt.Errorf("countersign envelope: %w", err)
+	}
+	return env, nil
+}
+
+// partyEmail returns the party's first published email address, or "".
+func partyEmail(party *org.Party) string {
+	for _, e := range party.Emails {
+		if e != nil && e.Address != "" {
+			return e.Address
+		}
+	}
+	return ""
+}
+
+// newToken mints an unguessable confirmation-link token.
+func newToken() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
