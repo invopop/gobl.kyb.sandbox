@@ -127,7 +127,7 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		return nil, ErrValidation.WithMessage("party must publish an email address to be verified")
 	}
 
-	rec, resend, err := d.upsert(ctx, subject, email, env)
+	rec, err := d.upsert(ctx, subject, email, env)
 	if err != nil {
 		d.log.Error("inbox.persist_failed", "caller", string(subject), "error", err.Error())
 		return nil, ErrInternal.WithCause(err)
@@ -135,20 +135,10 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 	d.log.Info("inbox.accepted",
 		"caller", string(subject),
 		"envelope", env.Head.UUID.String(),
-		"status", string(rec.Status),
-		"email_queued", resend,
 	)
 
-	if resend {
-		if err := d.sendConfirmation(ctx, rec); err != nil {
-			return nil, ErrInternal.WithMessage("could not send the confirmation email; retry later")
-		}
-	} else {
-		// Same digest, already attested: no second attestation needed,
-		// deliver the countersignature straight away.
-		if err := d.deliver(ctx, rec); err != nil {
-			return nil, ErrInternal.WithMessage("could not deliver the verification to the registration authority; retry later")
-		}
+	if err := d.sendConfirmation(ctx, rec); err != nil {
+		return nil, ErrInternal.WithMessage("could not send the confirmation email; retry later")
 	}
 
 	return rec, nil
@@ -247,15 +237,15 @@ func (d *Verifications) byToken(ctx context.Context, token string) (*models.Veri
 
 // upsert reads any existing record for the subject (preserving the
 // store's _rev token for optimistic concurrency), then writes the new
-// state. The second return reports whether a confirmation email is
-// needed: a re-submission of the exact envelope digest that was
-// already attested skips the email — the attestation binds to the
-// digest, so only delivery remains.
-func (d *Verifications) upsert(ctx context.Context, subject goblnet.Address, email string, env *gobl.Envelope) (*models.Verification, bool, error) {
+// state. Every submission restarts the attestation — new token, new
+// expiry, cleared confirmation and delivery state — so nothing is
+// ever countersigned and delivered without a fresh confirmation
+// through the emailed link, renewals of an unchanged digest included.
+func (d *Verifications) upsert(ctx context.Context, subject goblnet.Address, email string, env *gobl.Envelope) (*models.Verification, error) {
 	fresh := models.NewVerification(subject, email, env)
 	token, err := newToken()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	fresh.Token = token
 	fresh.TokenExpiresAt = fresh.ReceivedAt.Add(confirmTokenTTL)
@@ -263,39 +253,15 @@ func (d *Verifications) upsert(ctx context.Context, subject goblnet.Address, ema
 	prev, err := d.store.Get(ctx, subject)
 	switch {
 	case errors.Is(err, repos.ErrNotFound):
-		if err := d.store.Put(ctx, fresh); err != nil {
-			return nil, false, err
-		}
-		return fresh, true, nil
 	case err != nil:
-		return nil, false, err
+		return nil, err
+	default:
+		fresh.Rev = prev.Rev
 	}
-
-	if prev.ConfirmedAt != nil && prev.EnvelopeDigest == fresh.EnvelopeDigest {
-		// Renewal of an attested digest: keep the confirmation, reset
-		// the delivery bookkeeping so the fresh countersignature goes
-		// out again.
-		prev.Envelope = env
-		prev.EnvelopeUUID = fresh.EnvelopeUUID
-		prev.ReceivedAt = fresh.ReceivedAt
-		prev.Email = email
-		prev.Status = models.StatusConfirmed
-		prev.DeliveryAttempts = 0
-		prev.LastDeliveryError = ""
-		prev.LastDeliveryAt = nil
-		if err := d.store.Put(ctx, prev); err != nil {
-			return nil, false, err
-		}
-		return prev, false, nil
-	}
-
-	// Anything else restarts the attestation: new token, new expiry,
-	// cleared confirmation and delivery state.
-	fresh.Rev = prev.Rev
 	if err := d.store.Put(ctx, fresh); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return fresh, true, nil
+	return fresh, nil
 }
 
 // sendConfirmation sends the confirmation email and records the

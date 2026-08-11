@@ -705,29 +705,45 @@ func TestRedeliverRequiresConfirmation(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
-func TestRenewalAfterConfirmationSkipsEmail(t *testing.T) {
+func TestRenewalRequiresFreshConfirmation(t *testing.T) {
+	// Every submission restarts the attestation — an unchanged digest
+	// included. Nothing is countersigned and delivered in the
+	// background: the subject always sees the emailed link and
+	// confirms before anything reaches the registration authority.
 	f := newFixture(t)
 	party := f.newParty()
-	env1 := f.registeredEnvelope(party) // envelop assigns the party's UUID
+	env1 := f.registeredEnvelope(party)
 	body1, _ := json.Marshal(env1)
 	f.post(goblnet.InboxPath, body1).Body.Close() //nolint:errcheck
-	token := f.confirmToken()
-	f.postConfirm(token, url.Values{"accept": {"on"}}).Body.Close() //nolint:errcheck
+	token1 := f.confirmToken()
+	f.postConfirm(token1, url.Values{"accept": {"on"}}).Body.Close() //nolint:errcheck
 	f.waitForStatus(models.StatusDelivered, 2*time.Second)
+	require.Len(t, f.sender.records(), 1)
 
-	// The registry re-registers the unchanged party (same digest) and
-	// the subject forwards it again: the recorded attestation binds to
-	// the digest, so no second email — straight to delivery.
+	// Re-submit the same digest: a fresh link goes out, nothing is
+	// delivered, and the old link is dead.
 	env2 := f.registeredEnvelope(party)
-	require.Equal(t, env1.Head.Digest.Value, env2.Head.Digest.Value, "unchanged party renews with the same digest")
+	require.Equal(t, env1.Head.Digest.Value, env2.Head.Digest.Value)
 	body2, _ := json.Marshal(env2)
 	resp := f.post(goblnet.InboxPath, body2)
 	resp.Body.Close() //nolint:errcheck
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-	sent := f.waitForDelivery(2, 2*time.Second)
-	require.Len(t, sent, 2, "renewal delivers without a new attestation")
-	assert.Len(t, f.mail.records(), 1, "no second confirmation email")
+	rec, err := f.store.Get(context.Background(), f.subAddr)
+	require.NoError(t, err)
+	assert.Equal(t, models.StatusPending, rec.Status)
+	assert.Nil(t, rec.ConfirmedAt)
+	require.Len(t, f.waitForMail(2, 2*time.Second), 2, "fresh confirmation email per submission")
+	assert.Len(t, f.sender.records(), 1, "no background delivery")
+	old := f.getConfirm(token1)
+	old.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusNotFound, old.StatusCode)
+
+	// The new link completes the round and delivers again.
+	token2 := rec.Token
+	f.postConfirm(token2, url.Values{"accept": {"on"}}).Body.Close() //nolint:errcheck
+	f.waitForStatus(models.StatusDelivered, 2*time.Second)
+	require.Len(t, f.sender.records(), 2)
 }
 
 func TestChangedPartyRestartsAttestation(t *testing.T) {
@@ -790,32 +806,6 @@ func TestEmailFailureFailsRequest(t *testing.T) {
 	require.Len(t, f.mail.records(), 1)
 }
 
-func TestRenewalDeliveryFailureFailsRequest(t *testing.T) {
-	f := newFixture(t)
-	party := f.newParty()
-	env1 := f.registeredEnvelope(party)
-	body1, _ := json.Marshal(env1)
-	f.post(goblnet.InboxPath, body1).Body.Close() //nolint:errcheck
-	f.postConfirm(f.confirmToken(), url.Values{"accept": {"on"}}).Body.Close() //nolint:errcheck
-	f.waitForStatus(models.StatusDelivered, 2*time.Second)
-
-	// A renewal skips the email and delivers synchronously: a failed
-	// delivery to the registry fails the request so the sender retries.
-	f.sender.setErr(fmt.Errorf("%w: HTTP 503", goblnet.ErrUnavailable))
-	env2 := f.registeredEnvelope(party)
-	body2, _ := json.Marshal(env2)
-	resp := f.post(goblnet.InboxPath, body2)
-	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-	assert.Contains(t, readBody(t, resp), "registration authority")
-
-	f.sender.setErr(nil)
-	retry := f.post(goblnet.InboxPath, body2)
-	defer retry.Body.Close() //nolint:errcheck
-	require.Equal(t, http.StatusAccepted, retry.StatusCode)
-	rec, err := f.store.Get(context.Background(), f.subAddr)
-	require.NoError(t, err)
-	assert.Equal(t, models.StatusDelivered, rec.Status)
-}
 
 func TestWhoGet(t *testing.T) {
 	f := newFixture(t)
