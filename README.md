@@ -29,9 +29,10 @@ confirmation page behind the emailed link.
    own signed `org.Party`, countersigned by the registration
    authority (`lookup.sandbox.gobl.org`) — to `POST
    /.well-known/gobl/inbox` with a request token (spec §5.5). The
-   inbox rejects envelopes without a valid, unexpired authority
-   countersignature (403), envelopes registered under a different
-   authority (401), and parties that publish no email address (422).
+   inbox rejects envelopes without a valid, unexpired countersignature
+   from the configured authority (403) and parties that publish no
+   email address (422); party envelopes are bearer documents, so no
+   audience-bound signature is needed (spec §8.3).
 2. **Email.** The envelope is stored as a pending verification and a
    confirmation link (`https://kyb.sandbox.gobl.org/confirm/<token>`)
    is emailed to the party's published address — before the `202
