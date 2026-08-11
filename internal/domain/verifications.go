@@ -78,19 +78,18 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		return nil, ErrValidation.WithMessage("envelope failed validation: %s", err.Error())
 	}
 
-	// The subject must have signed for the authority we work for —
-	// the registration hop's signature, searched across the envelope
-	// since hop signatures accumulate in no significant order. This
-	// rejects envelopes registered under some other registry before
-	// any further key fetching.
-	subject, err := d.client.VerifyEnvelope(ctx, env, d.authority)
+	// Party envelopes are bearer documents (spec §8.3): no audience
+	// binding is required — the request token carries delivery intent,
+	// and the authority countersignature check below is what gates
+	// eligibility.
+	subject, err := d.client.VerifyEnvelope(ctx, env, "")
 	if err != nil {
 		if errors.Is(err, goblnet.ErrUnavailable) {
 			d.log.Warn("inbox.rejected", "reason", "verify_unavailable", "error", err.Error())
 			return nil, ErrUnavailable.WithMessage("could not reach the subject's key endpoint; retry later")
 		}
 		d.log.Warn("inbox.rejected", "reason", "verify_failed", "error", err.Error())
-		return nil, ErrUnauthorized.WithMessage("signature verification failed or envelope not registered with %s", d.authority)
+		return nil, ErrUnauthorized.WithMessage("signature verification failed")
 	}
 
 	// Any signature claiming this verifier's address must actually be

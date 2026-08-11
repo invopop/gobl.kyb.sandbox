@@ -429,20 +429,21 @@ func TestInboxRejectsExpiredRegistryCountersignature(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
-func TestInboxRejectsEnvelopeForAnotherAuthority(t *testing.T) {
-	// The subject's signature is bound to some other registry: this
-	// verifier only works for its configured authority.
+func TestInboxAcceptsBearerEnvelope(t *testing.T) {
+	// Party envelopes are bearer documents (spec §8.3): the canonical
+	// shape is the audience-free publication signature plus the
+	// registration authority's countersignature. The countersignature
+	// is what gates eligibility — audiences on subject signatures are
+	// ignored as legacy hop artifacts.
 	f := newFixture(t)
 	env, err := gobl.Envelop(f.newParty())
 	require.NoError(t, err)
-	require.NoError(t, env.Sign(f.subject,
-		head.WithIssuer(f.subAddr.String()),
-		head.WithAudience("other-registry.example")))
+	require.NoError(t, env.Sign(f.subject, head.WithIssuer(f.subAddr.String())))
 	f.counterSignAsRegistry(env)
 	body, _ := json.Marshal(env)
 	resp := f.post(goblnet.InboxPath, body)
 	defer resp.Body.Close() //nolint:errcheck
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 }
 
 func TestInboxRejectsNonPartyDocument(t *testing.T) {
