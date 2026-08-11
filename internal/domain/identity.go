@@ -100,6 +100,19 @@ func (d *Identity) CounterSign(env *gobl.Envelope, subject goblnet.Address) erro
 	if env == nil || env.Head == nil {
 		return errors.New("identity: cannot countersign a nil envelope")
 	}
+	// Supersede earlier rounds: the fresh countersignature replaces
+	// any of this verifier's own (spec §5.3). Other parties'
+	// signatures are never touched.
+	sigs := make([]*dsig.Signature, 0, len(env.Signatures)+1)
+	for _, sig := range env.Signatures {
+		if p, err := head.SignedPayload(sig); err == nil {
+			if iss, ierr := goblnet.ParseAddress(p.Iss); ierr == nil && iss == d.Address() {
+				continue
+			}
+		}
+		sigs = append(sigs, sig)
+	}
+	env.Signatures = sigs
 	return env.Sign(d.model.PrivateKey,
 		head.WithIssuer(d.Address().String()),
 		head.WithAudience(subject.String()),
