@@ -535,6 +535,7 @@ func TestConfirmFlow(t *testing.T) {
 	assert.Contains(t, pageBody, string(f.subAddr))
 	assert.Equal(t, "no-store", page.Header.Get("Cache-Control"), "token is in the URL")
 	assert.Equal(t, "no-referrer", page.Header.Get("Referrer-Policy"))
+	assert.Contains(t, pageBody, "form.dataset.sent", "submit blocks on first tap")
 
 	// Submitting without the checkbox re-renders the form.
 	miss := f.postConfirm(token, url.Values{})
