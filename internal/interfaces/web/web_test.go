@@ -354,10 +354,11 @@ func TestInboxAcceptsRegisteredEnvelope(t *testing.T) {
 	assert.Equal(t, "alice@example.com", rec.Email)
 	assert.NotEmpty(t, rec.Token)
 	assert.False(t, rec.TokenExpired(time.Now()))
+	assert.NotNil(t, rec.EmailSentAt, "202 means the email is already out")
 	require.NotNil(t, rec.Envelope)
 	assert.Len(t, rec.Envelope.Signatures, 2, "stored envelope is exactly what arrived")
 
-	// Confirmation email goes out asynchronously with the link.
+	// The confirmation email went out before the 202, carrying the link.
 	msgs := f.waitForMail(1, 2*time.Second)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "alice@example.com", msgs[0].To)
@@ -744,27 +745,61 @@ func TestChangedPartyRestartsAttestation(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, old.StatusCode)
 }
 
-func TestEmailFailureLeavesPending(t *testing.T) {
+func TestEmailFailureFailsRequest(t *testing.T) {
 	f := newFixture(t)
 	f.mail.err = fmt.Errorf("smtp: connection refused")
 	env := f.registeredEnvelope(f.newParty())
 	body, _ := json.Marshal(env)
 	resp := f.post(goblnet.InboxPath, body)
-	defer resp.Body.Close() //nolint:errcheck
-	require.Equal(t, http.StatusAccepted, resp.StatusCode, "the inbox POST is acknowledged regardless")
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"an unsent confirmation email must surface to the sender, not vanish behind a 202")
+	assert.Contains(t, readBody(t, resp), "confirmation email")
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		rec, err := f.store.Get(context.Background(), f.subAddr)
-		require.NoError(t, err)
-		if rec.LastEmailError != "" {
-			assert.Equal(t, models.StatusPending, rec.Status)
-			assert.Nil(t, rec.EmailSentAt)
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("email error never recorded")
+	// The failure is on the record: pending, error noted, nothing sent.
+	rec, err := f.store.Get(context.Background(), f.subAddr)
+	require.NoError(t, err)
+	assert.Equal(t, models.StatusPending, rec.Status)
+	assert.NotEmpty(t, rec.LastEmailError)
+	assert.Nil(t, rec.EmailSentAt)
+
+	// The sender retries the same envelope once the mailer recovers:
+	// a fresh link goes out and the request is acknowledged.
+	f.mail.err = nil
+	retry := f.post(goblnet.InboxPath, body)
+	defer retry.Body.Close() //nolint:errcheck
+	require.Equal(t, http.StatusAccepted, retry.StatusCode)
+	rec, err = f.store.Get(context.Background(), f.subAddr)
+	require.NoError(t, err)
+	assert.NotNil(t, rec.EmailSentAt)
+	assert.Empty(t, rec.LastEmailError)
+	require.Len(t, f.mail.records(), 1)
+}
+
+func TestRenewalDeliveryFailureFailsRequest(t *testing.T) {
+	f := newFixture(t)
+	party := f.newParty()
+	env1 := f.registeredEnvelope(party)
+	body1, _ := json.Marshal(env1)
+	f.post(goblnet.InboxPath, body1).Body.Close() //nolint:errcheck
+	f.postConfirm(f.confirmToken(), url.Values{"accept": {"on"}}).Body.Close() //nolint:errcheck
+	f.waitForStatus(models.StatusDelivered, 2*time.Second)
+
+	// A renewal skips the email and delivers synchronously: a failed
+	// delivery to the registry fails the request so the sender retries.
+	f.sender.setErr(fmt.Errorf("%w: HTTP 503", goblnet.ErrUnavailable))
+	env2 := f.registeredEnvelope(party)
+	body2, _ := json.Marshal(env2)
+	resp := f.post(goblnet.InboxPath, body2)
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Contains(t, readBody(t, resp), "registration authority")
+
+	f.sender.setErr(nil)
+	retry := f.post(goblnet.InboxPath, body2)
+	defer retry.Body.Close() //nolint:errcheck
+	require.Equal(t, http.StatusAccepted, retry.StatusCode)
+	rec, err := f.store.Get(context.Background(), f.subAddr)
+	require.NoError(t, err)
+	assert.Equal(t, models.StatusDelivered, rec.Status)
 }
 
 func TestWhoGet(t *testing.T) {

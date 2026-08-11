@@ -68,9 +68,10 @@ func (d *Verifications) Authority() goblnet.Address { return d.authority }
 // envelope containing the subject's org.Party, countersigned by the
 // registration authority. It verifies the subject's signature and the
 // authority's countersignature, requires a published email address,
-// persists the record, and queues the confirmation email. The
-// persisted record is returned once stored; the email is sent in the
-// background.
+// persists the record, and sends the confirmation email before
+// returning — a request is only acknowledged once its side effect is
+// done, so a failure surfaces to the sender for retry instead of
+// vanishing into a log line.
 func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*models.Verification, error) {
 	if err := env.Validate(); err != nil {
 		d.log.Warn("inbox.rejected", "reason", "validation", "error", err.Error())
@@ -137,17 +138,16 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		"email_queued", resend,
 	)
 
-	// Fire-and-forget side effects: the caller is acknowledged as soon
-	// as we've persisted. The goroutines mutate their record (status,
-	// email/delivery bookkeeping), so hand them a copy — the record
-	// returned to the caller stays immutable after return.
-	recCopy := *rec
 	if resend {
-		go d.emailAsync(&recCopy)
+		if err := d.sendConfirmation(ctx, rec); err != nil {
+			return nil, ErrInternal.WithMessage("could not send the confirmation email; retry later")
+		}
 	} else {
 		// Same digest, already attested: no second attestation needed,
 		// deliver the countersignature straight away.
-		go d.deliverAsync(&recCopy)
+		if err := d.deliver(ctx, rec); err != nil {
+			return nil, ErrInternal.WithMessage("could not deliver the verification to the registration authority; retry later")
+		}
 	}
 
 	return rec, nil
@@ -211,32 +211,9 @@ func (d *Verifications) Redeliver(ctx context.Context, addr goblnet.Address) (*m
 	if rec.ConfirmedAt == nil {
 		return nil, ErrValidation.WithMessage("verification for %s has not been confirmed", addr)
 	}
-
-	env, err := d.countersignedCopy(rec)
-	if err != nil {
-		return nil, ErrInternal.WithCause(err)
-	}
-	now := time.Now().UTC()
-	rec.DeliveryAttempts++
-	rec.LastDeliveryAt = &now
-
-	sendCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
-	defer cancel()
-	if err := d.sender.Send(sendCtx, d.authority, env); err != nil {
-		rec.Status = models.StatusFailed
-		rec.LastDeliveryError = err.Error()
-		_ = d.store.Put(ctx, rec)
+	if err := d.deliver(ctx, rec); err != nil {
 		return nil, ErrInternal.WithCause(fmt.Errorf("deliver countersigned envelope: %w", err))
 	}
-	rec.Status = models.StatusDelivered
-	rec.LastDeliveryError = ""
-	if err := d.store.Put(ctx, rec); err != nil {
-		return nil, ErrInternal.WithCause(err)
-	}
-	d.log.Info("verification delivered",
-		"address", string(rec.Address),
-		"envelope", rec.EnvelopeUUID.String(),
-	)
 	return rec, nil
 }
 
@@ -311,44 +288,49 @@ func (d *Verifications) upsert(ctx context.Context, subject goblnet.Address, ema
 	return fresh, true, nil
 }
 
-// emailAsync sends the confirmation email and records the outcome. A
-// failure leaves the record pending with the error noted — the
-// subject recovers by re-registering, which issues a fresh link.
-func (d *Verifications) emailAsync(rec *models.Verification) {
-	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+// sendConfirmation sends the confirmation email and records the
+// outcome on the record. A failure leaves the record pending with the
+// error noted and is returned to the caller — the subject recovers by
+// re-registering, which issues a fresh link.
+func (d *Verifications) sendConfirmation(ctx context.Context, rec *models.Verification) error {
+	sendCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
 	defer cancel()
 	msg := confirmationMessage(rec, d.identity.Address(), d.authority, d.publicBaseURL)
 	now := time.Now().UTC()
-	if err := d.mailer.Send(ctx, msg); err != nil {
+	if err := d.mailer.Send(sendCtx, msg); err != nil {
 		rec.LastEmailError = err.Error()
 		d.log.Warn("email.send_failed",
 			"address", string(rec.Address),
 			"to", rec.Email,
 			"error", err.Error(),
 		)
-	} else {
-		rec.EmailSentAt = &now
-		rec.LastEmailError = ""
-		d.log.Info("email.sent",
-			"address", string(rec.Address),
-			"to", rec.Email,
-		)
+		if perr := d.store.Put(ctx, rec); perr != nil {
+			d.log.Error("email.persist_failed", "address", string(rec.Address), "error", perr.Error())
+		}
+		return err
 	}
+	rec.EmailSentAt = &now
+	rec.LastEmailError = ""
+	d.log.Info("email.sent",
+		"address", string(rec.Address),
+		"to", rec.Email,
+	)
+	// The email is out: a bookkeeping failure here must not fail the
+	// request and trigger a duplicate send.
 	if err := d.store.Put(ctx, rec); err != nil {
 		d.log.Error("email.persist_failed",
 			"address", string(rec.Address),
 			"error", err.Error(),
 		)
 	}
+	return nil
 }
 
-// deliverAsync countersigns the stored envelope and POSTs it to the
-// authority's inbox, recording the outcome. Failures are not retried
-// in-process — recovery is the redeliver command or repeating the
-// confirmation.
-func (d *Verifications) deliverAsync(rec *models.Verification) {
-	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
-	defer cancel()
+// deliver countersigns the stored envelope, POSTs it to the
+// authority's inbox, and records the outcome. Failures are not
+// retried in-process — recovery is the redeliver command, repeating
+// the confirmation, or re-sending the registered envelope.
+func (d *Verifications) deliver(ctx context.Context, rec *models.Verification) error {
 	env, err := d.countersignedCopy(rec)
 	if err != nil {
 		rec.Status = models.StatusFailed
@@ -360,12 +342,14 @@ func (d *Verifications) deliverAsync(rec *models.Verification) {
 		if perr := d.store.Put(ctx, rec); perr != nil {
 			d.log.Error("deliver.persist_failed", "address", string(rec.Address), "error", perr.Error())
 		}
-		return
+		return err
 	}
 	rec.DeliveryAttempts++
 	now := time.Now().UTC()
 	rec.LastDeliveryAt = &now
-	if err := d.sender.Send(ctx, d.authority, env); err != nil {
+	sendCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
+	defer cancel()
+	if err := d.sender.Send(sendCtx, d.authority, env); err != nil {
 		rec.Status = models.StatusFailed
 		rec.LastDeliveryError = err.Error()
 		d.log.Warn("deliver.failed",
@@ -374,20 +358,30 @@ func (d *Verifications) deliverAsync(rec *models.Verification) {
 			"attempts", rec.DeliveryAttempts,
 			"error", err.Error(),
 		)
-	} else {
-		rec.Status = models.StatusDelivered
-		rec.LastDeliveryError = ""
-		d.log.Info("deliver.sent",
-			"address", string(rec.Address),
-			"envelope", rec.EnvelopeUUID.String(),
-		)
+		if perr := d.store.Put(ctx, rec); perr != nil {
+			d.log.Error("deliver.persist_failed", "address", string(rec.Address), "error", perr.Error())
+		}
+		return err
 	}
+	rec.Status = models.StatusDelivered
+	rec.LastDeliveryError = ""
+	d.log.Info("deliver.sent",
+		"address", string(rec.Address),
+		"envelope", rec.EnvelopeUUID.String(),
+	)
 	if err := d.store.Put(ctx, rec); err != nil {
 		d.log.Error("deliver.persist_failed",
 			"address", string(rec.Address),
 			"error", err.Error(),
 		)
 	}
+	return nil
+}
+
+// deliverAsync runs deliver detached from a request: the confirm POST
+// answers the human immediately and the outcome lands on the record.
+func (d *Verifications) deliverAsync(rec *models.Verification) {
+	_ = d.deliver(context.Background(), rec)
 }
 
 // countersignedCopy countersigns a fresh copy of the stored envelope.

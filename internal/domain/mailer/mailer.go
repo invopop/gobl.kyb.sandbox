@@ -7,6 +7,7 @@ package mailer
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -83,7 +84,10 @@ func (s *SMTP) Send(ctx context.Context, msg Message) error {
 	}
 	defer c.Close() //nolint:errcheck
 	if ok, _ := c.Extension("STARTTLS"); ok {
-		if err := c.StartTLS(nil); err != nil {
+		// The config needs the server name for certificate verification;
+		// a nil config is rejected by crypto/tls outright.
+		tlsConf := &tls.Config{ServerName: s.host, MinVersion: tls.VersionTLS12}
+		if err := c.StartTLS(tlsConf); err != nil {
 			return fmt.Errorf("mailer: starttls: %w", err)
 		}
 	}
