@@ -903,3 +903,57 @@ func TestRequestAuth(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, page.StatusCode, "reachable without a token — 404, not 401")
 	})
 }
+
+func TestInboxAcceptsOwnCountersignatureAboard(t *testing.T) {
+	// A subject may re-submit the fully endorsed envelope (our own
+	// earlier countersignature included) — e.g. republishing after the
+	// registry round trip. Our genuine signature aboard is fine.
+	f := newFixture(t)
+	party := f.newParty()
+	env := f.registeredEnvelope(party)
+	require.NoError(t, env.Sign(f.verifier.PrivateKey,
+		head.WithIssuer(f.verifier.Address().String()),
+		head.WithAudience(f.subAddr.String()),
+		head.WithExpiration(time.Now().Add(365*24*time.Hour))))
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+}
+
+func TestInboxRejectsForgedOwnCountersignature(t *testing.T) {
+	// A signature claiming this verifier's address but made with a
+	// different key: the envelope is not the one we attested to.
+	f := newFixture(t)
+	env := f.registeredEnvelope(f.newParty())
+	forged := dsig.NewES256Key()
+	require.NoError(t, env.Sign(forged,
+		head.WithIssuer(f.verifier.Address().String()),
+		head.WithAudience(f.subAddr.String())))
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestInboxAcceptsPublicationFirstSignature(t *testing.T) {
+	// A subject signing publication-first (no audience) with the
+	// registration signature appended binds through the search, not
+	// the first signature's audience.
+	f := newFixture(t)
+	party := f.newParty()
+	env, err := gobl.Envelop(party)
+	require.NoError(t, err)
+	require.NoError(t, env.Sign(f.subject, head.WithIssuer(f.subAddr.String())))
+	require.NoError(t, env.Sign(f.subject,
+		head.WithIssuer(f.subAddr.String()),
+		head.WithAudience(f.regAddr.String())))
+	f.counterSignAsRegistry(env)
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+}
