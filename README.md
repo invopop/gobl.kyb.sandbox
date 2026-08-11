@@ -32,10 +32,12 @@ confirmation page behind the emailed link.
    inbox rejects envelopes without a valid, unexpired authority
    countersignature (403), envelopes registered under a different
    authority (401), and parties that publish no email address (422).
-2. **Email.** On `202 Accepted` the envelope is stored as a pending
-   verification and a confirmation link
-   (`https://kyb.sandbox.gobl.org/confirm/<token>`) is emailed to the
-   party's published address. The link lives 72 hours; re-registering
+2. **Email.** The envelope is stored as a pending verification and a
+   confirmation link (`https://kyb.sandbox.gobl.org/confirm/<token>`)
+   is emailed to the party's published address — before the `202
+   Accepted`, so acknowledgement means the email is out. A send
+   failure answers `500` instead and the sender simply retries the
+   same delivery later. The link lives 72 hours; re-registering
    issues a fresh one.
 3. **Attest.** The link serves a single page with a checkbox: *"I
    confirm that I am legally entitled to use the identity and

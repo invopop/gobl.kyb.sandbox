@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The inbox sends the confirmation email (and, on renewals, delivers
+  the countersignature to the registry) before acknowledging: `202`
+  now means the side effect is done, and a failure answers `500` so
+  the sender retries instead of the outcome vanishing into a log
+  line. The `redeliver` command shares the same delivery path.
+
+### Fixed
+
+- SMTP STARTTLS handshake failed with "either ServerName or
+  InsecureSkipVerify must be specified": the TLS config now carries
+  the submission host as its server name (TLS 1.2 minimum).
+
+## [v0.1.0]
+
 ### Added
 
 - Initial implementation: a dummy KYB verification provider for the
