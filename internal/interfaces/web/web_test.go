@@ -640,22 +640,35 @@ func TestConfirmRetriesFailedDelivery(t *testing.T) {
 	f.post(goblnet.InboxPath, body).Body.Close() //nolint:errcheck
 	token := f.confirmToken()
 
-	// First confirmation: delivery to the authority fails.
+	// First confirmation: delivery to the authority fails. The page
+	// must say so — never success for an incomplete verification —
+	// while the attestation itself is durably recorded.
 	f.sender.setErr(fmt.Errorf("%w: HTTP 503", goblnet.ErrUnavailable))
 	resp := f.postConfirm(token, url.Values{"accept": {"on"}})
-	resp.Body.Close() //nolint:errcheck
-	require.Equal(t, http.StatusOK, resp.StatusCode, "attestation is recorded even when delivery fails")
-	rec := f.waitForStatus(models.StatusFailed, 2*time.Second)
+	respBody := readBody(t, resp)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Contains(t, respBody, "confirmation is saved")
+	assert.Contains(t, respBody, "Try again", "error page offers a retry")
+	rec := f.waitForStatus(models.StatusFailed, time.Second)
 	assert.NotEmpty(t, rec.LastDeliveryError)
 	assert.NotNil(t, rec.ConfirmedAt)
 
-	// Re-submitting the same link retries the delivery.
+	// Re-opening the link shows the failed state with a retry, not a
+	// thank-you.
+	page := f.getConfirm(token)
+	pageBody := readBody(t, page)
+	require.Equal(t, http.StatusOK, page.StatusCode)
+	assert.Contains(t, pageBody, "Try again")
+	assert.NotContains(t, pageBody, `name="accept"`, "attestation is not repeated")
+
+	// The retry button POSTs without the checkbox and retries delivery.
 	f.sender.setErr(nil)
-	retry := f.postConfirm(token, url.Values{"accept": {"on"}})
-	retry.Body.Close() //nolint:errcheck
+	retry := f.postConfirm(token, url.Values{})
+	retryBody := readBody(t, retry)
 	require.Equal(t, http.StatusOK, retry.StatusCode)
-	f.waitForStatus(models.StatusDelivered, 2*time.Second)
-	require.Len(t, f.waitForDelivery(1, 2*time.Second), 1)
+	assert.Contains(t, retryBody, "complete")
+	f.waitForStatus(models.StatusDelivered, time.Second)
+	require.Len(t, f.sender.records(), 1)
 }
 
 func TestRedeliverAfterFailure(t *testing.T) {

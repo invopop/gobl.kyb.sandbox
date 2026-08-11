@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Changed
 
+- The confirm POST delivers the countersignature to the registration
+  authority before answering: success renders only once the registry
+  has accepted (202), and a failed delivery renders an error page
+  with a retry button (503) — never a thank-you for a verification
+  that did not complete. The attestation itself is durable from the
+  first submit; the checkbox gates only that first attestation, and
+  later POSTs on the same link retry the delivery.
+
+### Changed
+
 - The inbox sends the confirmation email (and, on renewals, delivers
   the countersignature to the registry) before acknowledging: `202`
   now means the side effect is done, and a failure answers `500` so
