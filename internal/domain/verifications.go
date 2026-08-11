@@ -78,28 +78,28 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		return nil, ErrValidation.WithMessage("envelope failed validation: %s", err.Error())
 	}
 
-	subject, err := d.client.VerifyEnvelope(ctx, env, "")
+	// The subject must have signed for the authority we work for —
+	// the registration hop's signature, searched across the envelope
+	// since hop signatures accumulate in no significant order. This
+	// rejects envelopes registered under some other registry before
+	// any further key fetching.
+	subject, err := d.client.VerifyEnvelope(ctx, env, d.authority)
 	if err != nil {
 		if errors.Is(err, goblnet.ErrUnavailable) {
 			d.log.Warn("inbox.rejected", "reason", "verify_unavailable", "error", err.Error())
 			return nil, ErrUnavailable.WithMessage("could not reach the subject's key endpoint; retry later")
 		}
 		d.log.Warn("inbox.rejected", "reason", "verify_failed", "error", err.Error())
-		return nil, ErrUnauthorized.WithMessage("signature verification failed")
+		return nil, ErrUnauthorized.WithMessage("signature verification failed or envelope not registered with %s", d.authority)
 	}
 
-	// The subject's self-signature on a registered envelope is bound
-	// to the registration authority (its signed aud): require exactly
-	// the authority we work for, rejecting envelopes registered under
-	// some other registry before any further key fetching.
-	p, perr := head.SignedPayload(env.Signatures[0])
-	if perr != nil {
-		d.log.Warn("inbox.rejected", "reason", "verify_failed", "caller", string(subject), "error", perr.Error())
-		return nil, ErrUnauthorized.WithMessage("could not read signed payload")
-	}
-	if aud, aerr := goblnet.ParseAddress(p.Aud); aerr != nil || aud != d.authority {
-		d.log.Warn("inbox.rejected", "reason", "aud_mismatch", "caller", string(subject), "aud", p.Aud)
-		return nil, ErrUnauthorized.WithMessage("envelope audience must be the registration authority %s", d.authority)
+	// Any signature claiming this verifier's address must actually be
+	// ours: renewals return with our earlier countersignature aboard,
+	// and a broken or forged copy means the envelope is not the one we
+	// attested to.
+	if err := d.verifyOwnSignatures(env); err != nil {
+		d.log.Warn("inbox.rejected", "reason", "own_signature_invalid", "caller", string(subject), "error", err.Error())
+		return nil, ErrUnauthorized.WithMessage("envelope carries an invalid countersignature claiming this verifier")
 	}
 
 	// Only registered envelopes are eligible: the authority's
@@ -407,6 +407,31 @@ func (d *Verifications) countersignedCopy(rec *models.Verification) (*gobl.Envel
 		return nil, fmt.Errorf("countersign envelope: %w", err)
 	}
 	return env, nil
+}
+
+// verifyOwnSignatures checks every signature claiming this verifier's
+// address against its own published keys. Returns an error when one
+// claims an unknown key or fails verification; envelopes without any
+// such signature (a first submission) pass untouched.
+func (d *Verifications) verifyOwnSignatures(env *gobl.Envelope) error {
+	for _, sig := range env.Signatures {
+		p, err := head.SignedPayload(sig)
+		if err != nil {
+			continue
+		}
+		iss, err := goblnet.ParseAddress(p.Iss)
+		if err != nil || iss != d.identity.Address() {
+			continue
+		}
+		pub := d.identity.FindKey(sig.KeyID())
+		if pub == nil {
+			return fmt.Errorf("signature claims this verifier with unknown key %q", sig.KeyID())
+		}
+		if err := env.Head.Verify(sig, pub); err != nil {
+			return fmt.Errorf("signature claiming this verifier does not verify: %w", err)
+		}
+	}
+	return nil
 }
 
 // partyEmail returns the party's first published email address, or "".
