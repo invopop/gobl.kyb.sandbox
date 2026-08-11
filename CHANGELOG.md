@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Changed
 
+- Every submission restarts the attestation and sends a fresh
+  confirmation link — the same-digest renewal no longer countersigns
+  and delivers in the background. Nothing reaches the registration
+  authority without a confirmation through the emailed link.
+
 - The inbox searches the subject's signatures for one bound to the
   configured authority instead of reading the first signature's
   audience, matching gobl/net's new search semantics — publication-

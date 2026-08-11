@@ -32,7 +32,10 @@ confirmation page behind the emailed link.
    inbox rejects envelopes without a valid, unexpired countersignature
    from the configured authority (403) and parties that publish no
    email address (422); party envelopes are bearer documents, so no
-   audience-bound signature is needed (spec §8.3).
+   audience-bound signature is needed (spec §8.3). Every submission —
+   renewals of an unchanged party included — restarts the attestation:
+   nothing is countersigned without a fresh confirmation through the
+   emailed link.
 2. **Email.** The envelope is stored as a pending verification and a
    confirmation link (`https://kyb.sandbox.gobl.org/confirm/<token>`)
    is emailed to the party's published address — before the `202
