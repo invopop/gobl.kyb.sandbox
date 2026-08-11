@@ -535,6 +535,7 @@ func TestConfirmFlow(t *testing.T) {
 	assert.Contains(t, pageBody, string(f.subAddr))
 	assert.Equal(t, "no-store", page.Header.Get("Cache-Control"), "token is in the URL")
 	assert.Equal(t, "no-referrer", page.Header.Get("Referrer-Policy"))
+	assert.Contains(t, pageBody, "form.dataset.sent", "submit blocks on first tap")
 
 	// Submitting without the checkbox re-renders the form.
 	miss := f.postConfirm(token, url.Values{})
@@ -640,22 +641,35 @@ func TestConfirmRetriesFailedDelivery(t *testing.T) {
 	f.post(goblnet.InboxPath, body).Body.Close() //nolint:errcheck
 	token := f.confirmToken()
 
-	// First confirmation: delivery to the authority fails.
+	// First confirmation: delivery to the authority fails. The page
+	// must say so — never success for an incomplete verification —
+	// while the attestation itself is durably recorded.
 	f.sender.setErr(fmt.Errorf("%w: HTTP 503", goblnet.ErrUnavailable))
 	resp := f.postConfirm(token, url.Values{"accept": {"on"}})
-	resp.Body.Close() //nolint:errcheck
-	require.Equal(t, http.StatusOK, resp.StatusCode, "attestation is recorded even when delivery fails")
-	rec := f.waitForStatus(models.StatusFailed, 2*time.Second)
+	respBody := readBody(t, resp)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Contains(t, respBody, "confirmation is saved")
+	assert.Contains(t, respBody, "Try again", "error page offers a retry")
+	rec := f.waitForStatus(models.StatusFailed, time.Second)
 	assert.NotEmpty(t, rec.LastDeliveryError)
 	assert.NotNil(t, rec.ConfirmedAt)
 
-	// Re-submitting the same link retries the delivery.
+	// Re-opening the link shows the failed state with a retry, not a
+	// thank-you.
+	page := f.getConfirm(token)
+	pageBody := readBody(t, page)
+	require.Equal(t, http.StatusOK, page.StatusCode)
+	assert.Contains(t, pageBody, "Try again")
+	assert.NotContains(t, pageBody, `name="accept"`, "attestation is not repeated")
+
+	// The retry button POSTs without the checkbox and retries delivery.
 	f.sender.setErr(nil)
-	retry := f.postConfirm(token, url.Values{"accept": {"on"}})
-	retry.Body.Close() //nolint:errcheck
+	retry := f.postConfirm(token, url.Values{})
+	retryBody := readBody(t, retry)
 	require.Equal(t, http.StatusOK, retry.StatusCode)
-	f.waitForStatus(models.StatusDelivered, 2*time.Second)
-	require.Len(t, f.waitForDelivery(1, 2*time.Second), 1)
+	assert.Contains(t, retryBody, "complete")
+	f.waitForStatus(models.StatusDelivered, time.Second)
+	require.Len(t, f.sender.records(), 1)
 }
 
 func TestRedeliverAfterFailure(t *testing.T) {
@@ -889,4 +903,58 @@ func TestRequestAuth(t *testing.T) {
 		defer page.Body.Close() //nolint:errcheck
 		assert.Equal(t, http.StatusNotFound, page.StatusCode, "reachable without a token — 404, not 401")
 	})
+}
+
+func TestInboxAcceptsOwnCountersignatureAboard(t *testing.T) {
+	// A subject may re-submit the fully endorsed envelope (our own
+	// earlier countersignature included) — e.g. republishing after the
+	// registry round trip. Our genuine signature aboard is fine.
+	f := newFixture(t)
+	party := f.newParty()
+	env := f.registeredEnvelope(party)
+	require.NoError(t, env.Sign(f.verifier.PrivateKey,
+		head.WithIssuer(f.verifier.Address().String()),
+		head.WithAudience(f.subAddr.String()),
+		head.WithExpiration(time.Now().Add(365*24*time.Hour))))
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+}
+
+func TestInboxRejectsForgedOwnCountersignature(t *testing.T) {
+	// A signature claiming this verifier's address but made with a
+	// different key: the envelope is not the one we attested to.
+	f := newFixture(t)
+	env := f.registeredEnvelope(f.newParty())
+	forged := dsig.NewES256Key()
+	require.NoError(t, env.Sign(forged,
+		head.WithIssuer(f.verifier.Address().String()),
+		head.WithAudience(f.subAddr.String())))
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestInboxAcceptsPublicationFirstSignature(t *testing.T) {
+	// A subject signing publication-first (no audience) with the
+	// registration signature appended binds through the search, not
+	// the first signature's audience.
+	f := newFixture(t)
+	party := f.newParty()
+	env, err := gobl.Envelop(party)
+	require.NoError(t, err)
+	require.NoError(t, env.Sign(f.subject, head.WithIssuer(f.subAddr.String())))
+	require.NoError(t, env.Sign(f.subject,
+		head.WithIssuer(f.subAddr.String()),
+		head.WithAudience(f.regAddr.String())))
+	f.counterSignAsRegistry(env)
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 }

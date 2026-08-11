@@ -31,6 +31,7 @@ var confirmPage = template.Must(template.New("confirm").Parse(`<!DOCTYPE html>
   input[type=checkbox] { margin-top: 0.25rem; }
   button { background: #1c1917; color: #fff; border: 0; border-radius: 0.375rem;
            padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.6; cursor: default; }
   .error { color: #b91c1c; }
   .note { color: #57534e; font-size: 0.875rem; }
 </style>
@@ -54,9 +55,26 @@ was requested through the registration authority
   <button type="submit">Confirm verification</button>
 </form>
 {{end}}
+{{if .ShowRetry}}
+<form method="post">
+  <button type="submit">Try again</button>
+</form>
+{{end}}
 <p class="note">This sandbox service verifies control of the published
 email address and records the declaration above — nothing more.</p>
 </main>
+<script>
+  // Delivery is synchronous and can take a moment: block re-submits
+  // on the first tap. The server is idempotent regardless.
+  for (const form of document.querySelectorAll("form")) {
+    form.addEventListener("submit", (e) => {
+      if (form.dataset.sent) { e.preventDefault(); return; }
+      form.dataset.sent = "1";
+      const btn = form.querySelector("button");
+      if (btn) { btn.disabled = true; btn.textContent = "Please wait\u2026"; }
+    });
+  }
+</script>
 </body>
 </html>
 `))
@@ -69,6 +87,7 @@ type confirmView struct {
 	Message   string
 	Error     string
 	ShowForm  bool
+	ShowRetry bool
 }
 
 // renderConfirm writes a confirm page. The emailed token is in the
@@ -97,9 +116,15 @@ func confirmErrorView(err error) (int, confirmView) {
 			Error: "This confirmation link has expired. Register the identity again to receive a fresh one.",
 		}
 	case errors.Is(err, domain.ErrUnavailable):
+		msg := "The verification could not be processed right now. Try again in a few minutes."
+		var de *domain.Error
+		if errors.As(err, &de) && de.Message() != "" {
+			msg = de.Message()
+		}
 		return http.StatusServiceUnavailable, confirmView{
-			Title: "Temporarily unavailable",
-			Error: "The verification could not be processed right now. Try the link again in a few minutes.",
+			Title:     "Temporarily unavailable",
+			Error:     msg,
+			ShowRetry: true,
 		}
 	default:
 		return http.StatusInternalServerError, confirmView{
@@ -121,9 +146,12 @@ func resultView(s *domain.Setup, rec *models.Verification) confirmView {
 	case models.StatusDelivered:
 		view.Message = "The verification is complete and has been delivered to the registration authority. The registry will return the updated registration to your service shortly."
 	case models.StatusFailed:
-		view.Message = "Your confirmation is recorded, but delivering the result to the registration authority failed. Delivery will be retried; no further action is needed on your side."
+		view.Title = "Delivery failed"
+		view.Error = "Your confirmation is saved, but delivering the result to the registration authority failed. Try again now, or come back to this link later."
+		view.ShowRetry = true
 	default:
 		view.Message = "Your confirmation is recorded and the result is being delivered to the registration authority."
+		view.ShowRetry = true
 	}
 	return view
 }
@@ -151,34 +179,34 @@ func handleConfirmPage(s *domain.Setup, log *slog.Logger) http.HandlerFunc {
 	}
 }
 
-// handleConfirmSubmit records the attestation. The checkbox is
-// validated here — an unchecked box re-renders the form — and the
-// domain call is idempotent, so retries and double-submits land on
-// the thank-you page.
+// handleConfirmSubmit records the attestation and delivers the
+// result. The checkbox gates only the first attestation — once it is
+// recorded, a POST is the retry button and goes straight to Confirm,
+// which re-attempts an undelivered outcome. Delivery failures render
+// as errors with a retry so the subject never sees success for a
+// verification that did not complete.
 func handleConfirmSubmit(s *domain.Setup, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.PathValue("token")
-		if err := r.ParseForm(); err != nil || r.PostForm.Get("accept") != "on" {
-			rec, cerr := s.Verifications().Confirmation(r.Context(), token)
-			if cerr != nil {
-				status, view := confirmErrorView(cerr)
-				renderConfirm(w, status, view)
-				return
-			}
-			if rec.Status != models.StatusPending {
-				renderConfirm(w, http.StatusOK, resultView(s, rec))
-				return
-			}
-			renderConfirm(w, http.StatusUnprocessableEntity, confirmView{
-				Title:     "Verify your GOBL Net identity",
-				Address:   string(rec.Address),
-				Authority: string(s.Verifications().Authority()),
-				Error:     "Tick the declaration box to confirm the verification.",
-				ShowForm:  true,
-			})
+		rec, err := s.Verifications().Confirmation(r.Context(), token)
+		if err != nil {
+			status, view := confirmErrorView(err)
+			renderConfirm(w, status, view)
 			return
 		}
-		rec, err := s.Verifications().Confirm(r.Context(), token)
+		if rec.Status == models.StatusPending {
+			if perr := r.ParseForm(); perr != nil || r.PostForm.Get("accept") != "on" {
+				renderConfirm(w, http.StatusUnprocessableEntity, confirmView{
+					Title:     "Verify your GOBL Net identity",
+					Address:   string(rec.Address),
+					Authority: string(s.Verifications().Authority()),
+					Error:     "Tick the declaration box to confirm the verification.",
+					ShowForm:  true,
+				})
+				return
+			}
+		}
+		rec, err = s.Verifications().Confirm(r.Context(), token)
 		if err != nil {
 			status, view := confirmErrorView(err)
 			renderConfirm(w, status, view)

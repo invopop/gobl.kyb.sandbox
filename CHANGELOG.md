@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Changed
 
+- The inbox searches the subject's signatures for one bound to the
+  configured authority instead of reading the first signature's
+  audience, matching gobl/net's new search semantics — publication-
+  first signature ordering and accumulated hop signatures all bind.
+  Any signature claiming this verifier's own address must verify
+  against its published keys, so a renewal carrying a broken or
+  forged copy of an earlier countersignature is rejected.
+
+- The confirm POST delivers the countersignature to the registration
+  authority before answering: success renders only once the registry
+  has accepted (202), and a failed delivery renders an error page
+  with a retry button (503) — never a thank-you for a verification
+  that did not complete. The attestation itself is durable from the
+  first submit; the checkbox gates only that first attestation, and
+  later POSTs on the same link retry the delivery. The submit button
+  blocks on first tap.
+
+### Changed
+
 - The inbox sends the confirmation email (and, on renewals, delivers
   the countersignature to the registry) before acknowledging: `202`
   now means the side effect is done, and a failure answers `500` so

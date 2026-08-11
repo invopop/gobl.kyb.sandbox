@@ -78,28 +78,28 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		return nil, ErrValidation.WithMessage("envelope failed validation: %s", err.Error())
 	}
 
-	subject, err := d.client.VerifyEnvelope(ctx, env, "")
+	// The subject must have signed for the authority we work for —
+	// the registration hop's signature, searched across the envelope
+	// since hop signatures accumulate in no significant order. This
+	// rejects envelopes registered under some other registry before
+	// any further key fetching.
+	subject, err := d.client.VerifyEnvelope(ctx, env, d.authority)
 	if err != nil {
 		if errors.Is(err, goblnet.ErrUnavailable) {
 			d.log.Warn("inbox.rejected", "reason", "verify_unavailable", "error", err.Error())
 			return nil, ErrUnavailable.WithMessage("could not reach the subject's key endpoint; retry later")
 		}
 		d.log.Warn("inbox.rejected", "reason", "verify_failed", "error", err.Error())
-		return nil, ErrUnauthorized.WithMessage("signature verification failed")
+		return nil, ErrUnauthorized.WithMessage("signature verification failed or envelope not registered with %s", d.authority)
 	}
 
-	// The subject's self-signature on a registered envelope is bound
-	// to the registration authority (its signed aud): require exactly
-	// the authority we work for, rejecting envelopes registered under
-	// some other registry before any further key fetching.
-	p, perr := head.SignedPayload(env.Signatures[0])
-	if perr != nil {
-		d.log.Warn("inbox.rejected", "reason", "verify_failed", "caller", string(subject), "error", perr.Error())
-		return nil, ErrUnauthorized.WithMessage("could not read signed payload")
-	}
-	if aud, aerr := goblnet.ParseAddress(p.Aud); aerr != nil || aud != d.authority {
-		d.log.Warn("inbox.rejected", "reason", "aud_mismatch", "caller", string(subject), "aud", p.Aud)
-		return nil, ErrUnauthorized.WithMessage("envelope audience must be the registration authority %s", d.authority)
+	// Any signature claiming this verifier's address must actually be
+	// ours: renewals return with our earlier countersignature aboard,
+	// and a broken or forged copy means the envelope is not the one we
+	// attested to.
+	if err := d.verifyOwnSignatures(env); err != nil {
+		d.log.Warn("inbox.rejected", "reason", "own_signature_invalid", "caller", string(subject), "error", err.Error())
+		return nil, ErrUnauthorized.WithMessage("envelope carries an invalid countersignature claiming this verifier")
 	}
 
 	// Only registered envelopes are eligible: the authority's
@@ -161,39 +161,48 @@ func (d *Verifications) Confirmation(ctx context.Context, token string) (*models
 	return d.byToken(ctx, token)
 }
 
-// Confirm records the subject's legal attestation and queues delivery
-// of the verifier countersignature to the registration authority. The
-// call is idempotent: a record already confirmed (or delivered) is
-// returned unchanged, and a failed delivery is retried.
+// Confirm records the subject's legal attestation and delivers the
+// verifier countersignature to the registration authority before
+// returning, so a failed delivery surfaces to the page instead of
+// only reaching the logs. The call is idempotent: a delivered record
+// is returned unchanged, and a confirmed or failed one retries the
+// delivery — the attestation itself is durable from the first call.
 func (d *Verifications) Confirm(ctx context.Context, token string) (*models.Verification, error) {
 	rec, err := d.byToken(ctx, token)
 	if err != nil {
 		return nil, err
 	}
-	if rec.Status == models.StatusConfirmed || rec.Status == models.StatusDelivered {
+	if rec.Status == models.StatusDelivered {
 		return rec, nil
 	}
-	now := time.Now().UTC()
 	if rec.ConfirmedAt == nil {
+		now := time.Now().UTC()
 		rec.ConfirmedAt = &now
-	}
-	rec.Status = models.StatusConfirmed
-	rec.LastDeliveryError = ""
-	if err := d.store.Put(ctx, rec); err != nil {
-		if errors.Is(err, repos.ErrConflict) {
-			// A concurrent confirmation won the write; the outcome the
-			// subject wanted has happened.
-			return d.byToken(ctx, token)
+		rec.Status = models.StatusConfirmed
+		if err := d.store.Put(ctx, rec); err != nil {
+			if errors.Is(err, repos.ErrConflict) {
+				// A concurrent confirmation won the write; re-read and
+				// carry on to delivery — the registry's inbox treats a
+				// duplicate of the same digest as an idempotent renewal.
+				if rec, err = d.byToken(ctx, token); err != nil {
+					return nil, err
+				}
+			} else {
+				d.log.Error("confirm.persist_failed", "address", string(rec.Address), "error", err.Error())
+				return nil, ErrInternal.WithCause(err)
+			}
 		}
-		d.log.Error("confirm.persist_failed", "address", string(rec.Address), "error", err.Error())
-		return nil, ErrInternal.WithCause(err)
+		d.log.Info("confirm.accepted",
+			"address", string(rec.Address),
+			"envelope", rec.EnvelopeUUID.String(),
+		)
 	}
-	d.log.Info("confirm.accepted",
-		"address", string(rec.Address),
-		"envelope", rec.EnvelopeUUID.String(),
-	)
-	recCopy := *rec
-	go d.deliverAsync(&recCopy)
+	if rec.Status == models.StatusDelivered {
+		return rec, nil
+	}
+	if err := d.deliver(ctx, rec); err != nil {
+		return nil, ErrUnavailable.WithMessage("your confirmation is saved, but the result could not be delivered to the registration authority — try this link again in a few minutes")
+	}
 	return rec, nil
 }
 
@@ -378,12 +387,6 @@ func (d *Verifications) deliver(ctx context.Context, rec *models.Verification) e
 	return nil
 }
 
-// deliverAsync runs deliver detached from a request: the confirm POST
-// answers the human immediately and the outcome lands on the record.
-func (d *Verifications) deliverAsync(rec *models.Verification) {
-	_ = d.deliver(context.Background(), rec)
-}
-
 // countersignedCopy countersigns a fresh copy of the stored envelope.
 // The stored envelope is never signed directly: Envelope.Sign clears
 // every signature when post-sign validation fails, and each delivery
@@ -404,6 +407,31 @@ func (d *Verifications) countersignedCopy(rec *models.Verification) (*gobl.Envel
 		return nil, fmt.Errorf("countersign envelope: %w", err)
 	}
 	return env, nil
+}
+
+// verifyOwnSignatures checks every signature claiming this verifier's
+// address against its own published keys. Returns an error when one
+// claims an unknown key or fails verification; envelopes without any
+// such signature (a first submission) pass untouched.
+func (d *Verifications) verifyOwnSignatures(env *gobl.Envelope) error {
+	for _, sig := range env.Signatures {
+		p, err := head.SignedPayload(sig)
+		if err != nil {
+			continue
+		}
+		iss, err := goblnet.ParseAddress(p.Iss)
+		if err != nil || iss != d.identity.Address() {
+			continue
+		}
+		pub := d.identity.FindKey(sig.KeyID())
+		if pub == nil {
+			return fmt.Errorf("signature claims this verifier with unknown key %q", sig.KeyID())
+		}
+		if err := env.Head.Verify(sig, pub); err != nil {
+			return fmt.Errorf("signature claiming this verifier does not verify: %w", err)
+		}
+	}
+	return nil
 }
 
 // partyEmail returns the party's first published email address, or "".
