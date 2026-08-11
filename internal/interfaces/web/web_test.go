@@ -962,3 +962,35 @@ func TestInboxIgnoresSignatureOrder(t *testing.T) {
 	defer resp.Body.Close() //nolint:errcheck
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 }
+
+func TestCounterSignSupersedesOwnSignature(t *testing.T) {
+	// A re-verification of an envelope that already carries our
+	// earlier countersignature replaces it (spec §5.3) instead of
+	// stacking a second one.
+	f := newFixture(t)
+	party := f.newParty()
+	env := f.registeredEnvelope(party)
+	require.NoError(t, env.Sign(f.verifier.PrivateKey,
+		head.WithIssuer(f.verifier.Address().String()),
+		head.WithAudience(f.subAddr.String()),
+		head.WithExpiration(time.Now().Add(365*24*time.Hour))))
+
+	body, _ := json.Marshal(env)
+	f.post(goblnet.InboxPath, body).Body.Close() //nolint:errcheck
+	f.postConfirm(f.confirmToken(), url.Values{"accept": {"on"}}).Body.Close() //nolint:errcheck
+	f.waitForStatus(models.StatusDelivered, 2*time.Second)
+
+	sent := f.sender.records()
+	require.Len(t, sent, 1)
+	delivered := sent[0].env
+	n := 0
+	for _, sig := range delivered.Signatures {
+		p, err := head.SignedPayload(sig)
+		require.NoError(t, err)
+		if p.Iss == f.verifier.Address().String() {
+			n++
+		}
+	}
+	assert.Equal(t, 1, n, "one verifier countersignature, the fresh one")
+	assert.Len(t, delivered.Signatures, 3, "subject + registry + verifier")
+}
