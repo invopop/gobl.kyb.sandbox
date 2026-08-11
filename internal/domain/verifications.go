@@ -78,15 +78,20 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		return nil, ErrValidation.WithMessage("envelope failed validation: %s", err.Error())
 	}
 
-	// Party envelopes are bearer documents (spec §8.3): no audience
-	// binding is required — the request token carries delivery intent,
+	// Party envelopes are bearer documents (spec §8.3): the subject is
+	// the address the party document itself declares, attested by a
+	// valid self-signature. The request token carries delivery intent,
 	// and the authority countersignature check below is what gates
 	// eligibility.
-	subject, err := d.client.VerifyEnvelope(ctx, env, "")
+	subject, err := d.client.VerifyParty(ctx, env)
 	if err != nil {
-		if errors.Is(err, goblnet.ErrUnavailable) {
+		switch {
+		case errors.Is(err, goblnet.ErrUnavailable):
 			d.log.Warn("inbox.rejected", "reason", "verify_unavailable", "error", err.Error())
 			return nil, ErrUnavailable.WithMessage("could not reach the subject's key endpoint; retry later")
+		case errors.Is(err, goblnet.ErrPartyMissing):
+			d.log.Warn("inbox.rejected", "reason", "not_a_party", "error", err.Error())
+			return nil, ErrValidation.WithMessage("verification envelope must contain an org.Party declaring a gobl: endpoint")
 		}
 		d.log.Warn("inbox.rejected", "reason", "verify_failed", "error", err.Error())
 		return nil, ErrUnauthorized.WithMessage("signature verification failed")
@@ -114,11 +119,8 @@ func (d *Verifications) Receive(ctx context.Context, env *gobl.Envelope) (*model
 		return nil, ErrForbidden.WithMessage("envelope must carry a valid registration countersignature from %s", d.authority)
 	}
 
-	party, ok := env.Extract().(*org.Party)
-	if !ok {
-		d.log.Warn("inbox.rejected", "reason", "not_a_party", "caller", string(subject))
-		return nil, ErrValidation.WithMessage("verification envelope must contain an org.Party document")
-	}
+	// VerifyParty guarantees the document is an org.Party.
+	party := env.Extract().(*org.Party)
 	email := partyEmail(party)
 	if email == "" {
 		d.log.Warn("inbox.rejected", "reason", "no_email", "caller", string(subject))

@@ -959,3 +959,16 @@ func TestInboxAcceptsPublicationFirstSignature(t *testing.T) {
 	defer resp.Body.Close() //nolint:errcheck
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 }
+
+func TestInboxIgnoresSignatureOrder(t *testing.T) {
+	// The subject comes from the party document, never from signature
+	// position: a permuted registered envelope verifies identically.
+	f := newFixture(t)
+	env := f.registeredEnvelope(f.newParty())
+	env.Signatures[0], env.Signatures[1] = env.Signatures[1], env.Signatures[0]
+
+	body, _ := json.Marshal(env)
+	resp := f.post(goblnet.InboxPath, body)
+	defer resp.Body.Close() //nolint:errcheck
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+}
