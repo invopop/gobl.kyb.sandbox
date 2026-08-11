@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   with a retry button (503) — never a thank-you for a verification
   that did not complete. The attestation itself is durable from the
   first submit; the checkbox gates only that first attestation, and
-  later POSTs on the same link retry the delivery.
+  later POSTs on the same link retry the delivery. The submit button
+  blocks on first tap.
 
 ### Changed
 

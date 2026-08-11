@@ -31,6 +31,7 @@ var confirmPage = template.Must(template.New("confirm").Parse(`<!DOCTYPE html>
   input[type=checkbox] { margin-top: 0.25rem; }
   button { background: #1c1917; color: #fff; border: 0; border-radius: 0.375rem;
            padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.6; cursor: default; }
   .error { color: #b91c1c; }
   .note { color: #57534e; font-size: 0.875rem; }
 </style>
@@ -62,6 +63,18 @@ was requested through the registration authority
 <p class="note">This sandbox service verifies control of the published
 email address and records the declaration above — nothing more.</p>
 </main>
+<script>
+  // Delivery is synchronous and can take a moment: block re-submits
+  // on the first tap. The server is idempotent regardless.
+  for (const form of document.querySelectorAll("form")) {
+    form.addEventListener("submit", (e) => {
+      if (form.dataset.sent) { e.preventDefault(); return; }
+      form.dataset.sent = "1";
+      const btn = form.querySelector("button");
+      if (btn) { btn.disabled = true; btn.textContent = "Please wait\u2026"; }
+    });
+  }
+</script>
 </body>
 </html>
 `))
